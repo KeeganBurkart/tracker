@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { type FormEvent, useEffect, useMemo, useState } from 'react'
 import './App.css'
 
 type PlanEntry = {
@@ -15,6 +15,7 @@ type CalendarCell = {
 
 const PLAN_STORAGE_KEY = 'meditation-plan-text'
 const COMPLETION_STORAGE_KEY = 'meditation-completions'
+const MANUAL_PLAN_STORAGE_KEY = 'meditation-manual-plan'
 
 const DEFAULT_START_DURATION = 10
 const TARGET_DURATION = 60
@@ -173,6 +174,10 @@ function App() {
   const [plan, setPlan] = useState<PlanMap>({})
   const [planErrors, setPlanErrors] = useState<string[]>([])
   const [completions, setCompletions] = useState<Record<string, boolean>>({})
+  const [manualOverrides, setManualOverrides] = useState<PlanMap>({})
+  const [editingDate, setEditingDate] = useState<Date | null>(null)
+  const [editingDuration, setEditingDuration] = useState('')
+  const [editingError, setEditingError] = useState<string | null>(null)
 
   useEffect(() => {
     const storedPlan = localStorage.getItem(PLAN_STORAGE_KEY)
@@ -194,11 +199,29 @@ function App() {
         console.warn('Unable to restore completion data:', error)
       }
     }
+
+    const storedManualPlan = localStorage.getItem(MANUAL_PLAN_STORAGE_KEY)
+    if (storedManualPlan) {
+      try {
+        const parsed = JSON.parse(storedManualPlan) as PlanMap
+        setManualOverrides(parsed)
+      } catch (error) {
+        console.warn('Unable to restore manual plan data:', error)
+      }
+    }
   }, [])
 
   useEffect(() => {
     localStorage.setItem(COMPLETION_STORAGE_KEY, JSON.stringify(completions))
   }, [completions])
+
+  useEffect(() => {
+    if (Object.keys(manualOverrides).length > 0) {
+      localStorage.setItem(MANUAL_PLAN_STORAGE_KEY, JSON.stringify(manualOverrides))
+    } else {
+      localStorage.removeItem(MANUAL_PLAN_STORAGE_KEY)
+    }
+  }, [manualOverrides])
 
   const calendar = useMemo(() => buildCalendar(currentMonth), [currentMonth])
 
@@ -208,15 +231,27 @@ function App() {
     return { monthDays: days.map((cell) => cell.date), completedCount: completed }
   }, [calendar, completions])
 
+  const combinedPlan = useMemo(() => {
+    const merged: PlanMap = { ...plan }
+    Object.entries(manualOverrides).forEach(([key, entry]) => {
+      if (entry.duration > 0) {
+        merged[key] = entry
+      } else {
+        delete merged[key]
+      }
+    })
+    return merged
+  }, [manualOverrides, plan])
+
   const planEntryList = useMemo(() => {
-    return Object.entries(plan)
+    return Object.entries(combinedPlan)
       .map(([key, entry]) => ({
         key,
         date: new Date(key),
         entry,
       }))
       .sort((a, b) => a.date.getTime() - b.date.getTime())
-  }, [plan])
+  }, [combinedPlan])
 
   const handleToggleDay = (date: Date) => {
     const key = formatKey(date)
@@ -224,6 +259,66 @@ function App() {
       ...prev,
       [key]: !prev[key],
     }))
+  }
+
+  const handleStartEditing = (date: Date) => {
+    const key = formatKey(date)
+    const manualEntry = manualOverrides[key]
+    const planEntry = plan[key]
+    setEditingDate(date)
+    setEditingDuration((manualEntry ?? planEntry)?.duration?.toString() ?? '')
+    setEditingError(null)
+  }
+
+  const handleCloseEditor = () => {
+    setEditingDate(null)
+    setEditingDuration('')
+    setEditingError(null)
+  }
+
+  const handleSaveManualEntry = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!editingDate) {
+      return
+    }
+
+    const key = formatKey(editingDate)
+
+    if (!editingDuration.trim()) {
+      setManualOverrides((prev) => {
+        const next = { ...prev }
+        delete next[key]
+        return next
+      })
+      handleCloseEditor()
+      return
+    }
+
+    const parsedDuration = Number.parseFloat(editingDuration)
+    if (!Number.isFinite(parsedDuration) || parsedDuration <= 0) {
+      setEditingError('Duration must be a positive number.')
+      return
+    }
+
+    const rounded = Math.round(parsedDuration)
+    setManualOverrides((prev) => ({
+      ...prev,
+      [key]: { duration: rounded },
+    }))
+    handleCloseEditor()
+  }
+
+  const handleClearManualEntry = () => {
+    if (!editingDate) {
+      return
+    }
+    const key = formatKey(editingDate)
+    setManualOverrides((prev) => {
+      const next = { ...prev }
+      delete next[key]
+      return next
+    })
+    handleCloseEditor()
   }
 
   const handleApplyPlan = () => {
@@ -239,10 +334,13 @@ function App() {
     setPlan(map)
     setPlanErrors(errors)
     setDraftPlanText('')
+    setManualOverrides({})
+    handleCloseEditor()
   }
 
   const todayKey = formatKey(new Date())
   const today = new Date()
+  const hasCustomPlanData = planEntryList.length > 0
 
   return (
     <div className="app-shell">
@@ -309,10 +407,19 @@ function App() {
         <div className="calendar-grid">
           {calendar.map(({ date, isCurrentMonth }) => {
             const key = formatKey(date)
-            const plannedDuration = plan[key]?.duration ?? getDefaultDuration(date)
-            const note = plan[key]?.note
+            const manualEntry = manualOverrides[key]
+            const planEntry = plan[key]
+            const effectiveDuration = manualEntry?.duration ?? planEntry?.duration
+            const note = manualEntry?.note ?? planEntry?.note
             const isCompleted = Boolean(completions[key])
             const isToday = key === todayKey
+            const isEditing = editingDate && formatKey(editingDate) === key
+            const durationText =
+              effectiveDuration !== undefined
+                ? `${effectiveDuration} min`
+                : hasCustomPlanData
+                ? ''
+                : `${getDefaultDuration(date)} min`
 
             return (
               <button
@@ -323,14 +430,34 @@ function App() {
                   isCurrentMonth ? 'current' : 'adjacent',
                   isCompleted ? 'completed' : '',
                   isToday ? 'today' : '',
+                  isEditing ? 'editing' : '',
                 ]
                   .filter(Boolean)
                   .join(' ')}
                 onClick={() => handleToggleDay(date)}
                 aria-pressed={isCompleted}
               >
-                <span className="day-number">{date.getDate()}</span>
-                <span className="day-duration">{plannedDuration} min</span>
+                <span
+                  className="day-number"
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Edit plan for ${formatDisplayDate(date)}`}
+                  onClick={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    handleStartEditing(date)
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      handleStartEditing(date)
+                    }
+                  }}
+                >
+                  {date.getDate()}
+                </span>
+                <span className="day-duration">{durationText || ' '}</span>
                 {note && <span className="day-note">{note}</span>}
                 <span className="day-status" aria-hidden="true">
                   {isCompleted ? '✓' : ''}
@@ -340,6 +467,42 @@ function App() {
           })}
         </div>
       </section>
+
+      {editingDate && (
+        <section className="day-editor no-print" aria-label="Edit selected day">
+          <div className="day-editor-header">
+            <h2>Edit {formatDisplayDate(editingDate)}</h2>
+            <button type="button" className="ghost-button" onClick={handleCloseEditor}>
+              Close
+            </button>
+          </div>
+          <form className="day-editor-form" onSubmit={handleSaveManualEntry}>
+            <label htmlFor="day-duration-input">Duration (minutes)</label>
+            <input
+              id="day-duration-input"
+              type="number"
+              min="1"
+              step="1"
+              value={editingDuration}
+              onChange={(event) => {
+                setEditingDuration(event.target.value)
+                setEditingError(null)
+              }}
+              placeholder="Leave blank to clear"
+            />
+            {editingError && <p className="day-editor-error">{editingError}</p>}
+            <div className="day-editor-actions">
+              <button type="submit" className="ghost-button">
+                Save
+              </button>
+              <button type="button" className="ghost-button" onClick={handleClearManualEntry}>
+                Clear
+              </button>
+            </div>
+            <p className="day-editor-help">Leave the field empty to remove any manual override for this day.</p>
+          </form>
+        </section>
+      )}
 
       <section className="plan-editor">
         <div className="plan-header">
